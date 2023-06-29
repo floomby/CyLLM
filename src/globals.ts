@@ -1,5 +1,6 @@
 import { Configuration, OpenAIApi } from "openai";
 import dotenv from "dotenv";
+import neo4j from "neo4j-driver";
 
 dotenv.config();
 
@@ -8,4 +9,9 @@ const configuration = new Configuration({
 });
 const openai = new OpenAIApi(configuration);
 
-export { openai };
+const driver = neo4j.driver(
+  "bolt://127.0.0.1:7687",
+  neo4j.auth.basic("neo4j", "charliepassword")
+);
+
+export { openai, driver };

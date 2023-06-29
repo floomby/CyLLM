@@ -1,9 +1,5 @@
 import neo4j, { Session } from "neo4j-driver";
-
-const driver = neo4j.driver(
-  "bolt://127.0.0.1:7687",
-  neo4j.auth.basic("neo4j", "charliepassword")
-);
+import { driver } from "./globals";
 
 const addEntity = async (
   session: Session,
