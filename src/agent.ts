@@ -1,9 +1,14 @@
-// We are going to try and query the neo4j database knowledge graph using cypher composed by a llm agent
-// Right now we are restricting ourselves to the small knowledge graph that I created as a test
-// and leaving the conversation part of the graph out of it
+// Agent for querying a neo4j database
 
-// TODO retry on openai errors
-// TODO gracefully handle neo4j errors
+// PRIORITY abort and retry if openai takes too long (hangs or whatever it does)
+// PRIORITY setup test suite
+// TODO if we get too far in the weeds we should move the cursor back up the tree and start a new branch
+// TODO figure out how to handle data compartmentalization in the database (neo4j might have something for this)
+// TODO gracefully handle neo4j db errors (not query errors, we got these covered)
+
+// Ideas:
+// - Creating summary nodes synthetically, calculating embeddings on them and using them as a reference point for the agent
+// - Creation of text indices (done) and using fuzzy matching to find nodes (not done)
 
 const model = "gpt-3.5-turbo-0613";
 
@@ -17,7 +22,7 @@ import { createChat } from "completions";
 
 enum QueryResultType {
   Success,
-  NoResults,
+  Empty,
   Error,
 }
 
@@ -37,7 +42,6 @@ type SearchTreeNode = Attempt & {
   parent: SearchTreeNode | null;
 };
 
-// maybe this should be plural (i.e. allow for multiple trees)
 class AttemptSearchTree {
   root: SearchTreeNode | null = null;
   previousQueries: Map<string, SearchTreeNode[]> = new Map();
@@ -116,26 +120,37 @@ enum AgentBehaviorMode {
   Ready,
   Answer,
   Explore,
+  NewIdea,
 }
 
 // prettier-ignore
 const initialSystem =
-`Respond only with valid neo4j cypher queries. Do not assume any knowledge beyond what is 
-already discovered. DO NOT use labels unless you are sure they exist. If you do not know 
-what to do create a simple query that will uncover more information about the graph instead.`;
+`Respond ONLY with valid neo4j cypher queries. Do not assume any knowledge beyond what is 
+already discovered. Prefer case insensitive queries.`;
 
 // prettier-ignore
 const emptySystem =
 `Respond only with valid neo4j cypher queries. DO NOT use labels unless you are sure they exist. DO NOT use 
-relationships unless you are sure that they exist. If you would like to discover if a relationship exists,
-create a query to discover if it exists. If it is unclearer what the obvious query should be then create a 
-simple query that will uncover more information about the knowledge graph. If the query was not working then 
-suggest something else.`;
+relationships unless you are sure that they exist. The data you are looking for is probably not where you think 
+it is and will require looking for relationships that you have not yet discovered. Prefer case insensitive queries.`;
+
+// prettier-ignore
+const errorSystem =
+`Respond only with valid neo4j cypher queries. Fix the users query in accordance with the error message.`
 
 // prettier-ignore
 const exploreSystem =
 `Help the user discover new information about the knowledge graph in the database. Then tell the user what you 
-have discoverd in a concise way. Do not respond with null information.`;
+have discoverd in a concise way. DO NOT respond with null information. Your response should be a concise representation 
+of what you discovered.`;
+
+// // prettier-ignore
+// const newIdeaSystem =
+// `Respond only with valid neo4j cypher queries. DO NOT use labels unless you are sure they exist. DO NOT use
+// relationships unless you are sure that they exist. If you would like to discover if a relationship exists,
+// create a query to discover if it exists. If it is unclearer what the obvious query should be then create a
+// simple query that will uncover more information about the knowledge graph. If the query was not working then
+// suggest something else.`;
 
 // prettier-ignore
 const evaluateSystem =
@@ -159,9 +174,7 @@ Previously discovered knowledge
 ${discoveredKnowledge}
 ======
 
-Objective: ${objective}
-
-`;
+Objective: ${objective}`;
   }
 
   private static emptyTemplate(
@@ -169,24 +182,39 @@ Objective: ${objective}
     objective: string,
     dbQuery: string
   ) {
-    return `I used this query, but I got no results.
-
+    return `This query returned no results. Please try again.
+\`\`\`cypher
 ${dbQuery}
+\`\`\`
 
-I need to figure out: ${objective}
+Objective: ${objective}
 
-I know a few thing about the data in the database already:
+Previously discovered knowledge
 ======
 ${discoveredKnowledge}
 ======
 
-Give me the new query only, with no other text. We need to try a different query.
+Do not provide anything besides a valid cypher query.
 
 New query:
-\`\`\``;
+\`\`\`cypher
+`;
   }
 
-  // TODO Error template
+  private static errorTemplate(dbQuery: string, error: string) {
+    return `This query returned an error. Please try again.
+\`\`\`cypher
+${dbQuery}
+\`\`\`
+
+Error: ${error}
+
+Do not provide anything besides a valid cypher query.
+
+New query:
+\`\`\`cypher
+`;
+  }
 
   private static exploreTemplate(
     discoveredKnowledge: string,
@@ -225,7 +253,7 @@ What is the answer to this question: ${objective}`;
   ///// Utility functions
 
   private static async getAllProperties({ label }: { label: string }) {
-    console.log("CALLED FUNCTION: getAllProperties");
+    console.log("CALLED FUNCTION: getAllProperties", { label });
 
     // remove quotes from label if they exist
     const oldLabel = label;
@@ -241,6 +269,11 @@ What is the answer to this question: ${objective}`;
     RETURN collect(distinct propertyName) as propertyNames`);
     session.close();
 
+    console.log(
+      "getAllProperties result",
+      result.records[0].get("propertyNames")
+    );
+
     return {
       property_names: result.records[0].get("propertyNames") as string[],
     };
@@ -248,7 +281,7 @@ What is the answer to this question: ${objective}`;
 
   private static async reformulateDiscovery(discovery: string) {
     const chat = createChat({
-      model: "gpt-3.5-turbo-0613",
+      model,
       apiKey,
     });
 
@@ -314,7 +347,7 @@ What is the answer to this question: ${objective}`;
           this.behaviorMode = AgentBehaviorMode.Explore;
           makeQuery = false;
         } else {
-          throw new Error("Agent is stuck in a loop in explore mode.");
+          // throw new Error("Agent is stuck in a loop in explore mode.");
         }
       }
 
@@ -332,10 +365,30 @@ What is the answer to this question: ${objective}`;
       } else {
         switch (this.behaviorMode as AgentBehaviorMode) {
           case AgentBehaviorMode.Answer:
-            dbQuery = await this.empty();
+            if (cursor.resultType === QueryResultType.Empty) {
+              dbQuery = await this.empty();
+            } else if (cursor.resultType === QueryResultType.Error) {
+              dbQuery = await this.error();
+            } else {
+              console.log(
+                inspect(
+                  { ...cursor, parent: undefined, children: undefined },
+                  false,
+                  null,
+                  true
+                )
+              );
+              throw new Error("Agent is in an invalid state.");
+            }
             break;
+          // case AgentBehaviorMode.NewIdea:
+          //   dbQuery = await this.newIdea();
+          //   break;
           case AgentBehaviorMode.Explore:
             const discovery = await this.explore();
+            if (["null"].includes(discovery.toLowerCase())) {
+              break;
+            }
             // this.discoveredKnowledge += `\n${await Agent.reformulateDiscovery(discovery)}`;
             this.discoveredKnowledge += `\n${discovery}`;
             this.behaviorMode = AgentBehaviorMode.Answer;
@@ -384,35 +437,55 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const response = await openai.createChatCompletion({
-      model: model,
-      messages: [
-        {
-          role: "system",
-          content: initialSystem,
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.0,
-      max_tokens: this.maxTokens,
+    const chat = createChat({
+      model,
+      apiKey,
+      maxTokens: this.maxTokens,
+      // Seems to do worse with this function
+      // functions: [
+      //   {
+      //     name: "get_all_properties",
+      //     description:
+      //       "Returns all possible properties for a node with a given label",
+      //     parameters: {
+      //       type: "object",
+      //       properties: {
+      //         label: {
+      //           type: "string",
+      //           description:
+      //             "The label (kind) of node to get possible properties for",
+      //         },
+      //       },
+      //       required: ["label"],
+      //     },
+      //     function: Agent.getAllProperties,
+      //   },
+      // ],
+      // functionCall: "auto",
     });
 
-    const responseText = response.data.choices[0].message.content;
+    chat.addMessage({
+      role: "system",
+      content: initialSystem,
+    });
 
-    const finishReason = response.data.choices[0].finish_reason;
+    const response = await chat.sendMessage(prompt);
+
+    const responseText = response.content.trim();
+
+    const finishReason = response.finishReason;
 
     if (finishReason !== "stop") {
-      console.warn("WARNING: response did not finish");
+      console.warn("WARNING: response did not finish - ", finishReason);
     }
 
     if (this.verboseResponses) {
       console.log(`Initial query response >>>>\n${responseText}\n<<<<`);
     }
 
-    return responseText;
+    const newQuery = responseText.split("```")[0].trim();
+
+    return newQuery;
   }
 
   // When we get noting back from the database, we need to ask the agent to try and figure out why
@@ -428,28 +501,25 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const response = await openai.createChatCompletion({
-      model: model,
-      messages: [
-        {
-          role: "system",
-          content: emptySystem,
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.0,
-      max_tokens: this.maxTokens,
+    const chat = createChat({
+      model,
+      apiKey,
+      maxTokens: this.maxTokens,
     });
 
-    const responseText = response.data.choices[0].message.content;
+    chat.addMessage({
+      role: "system",
+      content: emptySystem,
+    });
 
-    const finishReason = response.data.choices[0].finish_reason;
+    const response = await chat.sendMessage(prompt);
+
+    const responseText = response.content.trim();
+
+    const finishReason = response.finishReason;
 
     if (finishReason !== "stop") {
-      console.warn("WARNING: response did not finish");
+      console.warn("WARNING: response did not finish - ", finishReason);
     }
 
     const newQuery = responseText.split("```")[0].trim();
@@ -462,8 +532,45 @@ What is the answer to this question: ${objective}`;
   }
 
   // TODO
-  // async evaluateError() {
-  // }
+  async error() {
+    const prompt = Agent.errorTemplate(
+      this.attempts.cursor.dbQuery,
+      this.attempts.cursor.error
+    );
+
+    if (this.verbosePrompts) {
+      console.log("prompt:", prompt);
+    }
+
+    const chat = createChat({
+      model,
+      apiKey,
+      maxTokens: this.maxTokens,
+    });
+
+    chat.addMessage({
+      role: "system",
+      content: errorSystem,
+    });
+
+    const response = await chat.sendMessage(prompt);
+
+    const responseText = response.content.trim();
+
+    const finishReason = response.finishReason;
+
+    if (finishReason !== "stop") {
+      console.warn("WARNING: response did not finish - ", finishReason);
+    }
+
+    const newQuery = responseText.split("```")[0].trim();
+
+    if (this.verboseResponses) {
+      console.log(`New query (error fix) response >>>>\n${responseText}\n<<<<`);
+    }
+
+    return newQuery;
+  }
 
   async explore() {
     const prompt = Agent.exploreTemplate(
@@ -472,14 +579,14 @@ What is the answer to this question: ${objective}`;
       this.attempts.cursor.dbQuery
     );
 
-    // if (this.verbosePrompts) {
-    console.log("prompt:", prompt);
-    // }
+    if (this.verbosePrompts) {
+      console.log("prompt:", prompt);
+    }
 
     const chat = createChat({
-      model: model,
+      model,
       apiKey,
-      temperature: 0.0,
+      temperature: 0.2,
       maxTokens: this.maxTokens,
       functions: [
         {
@@ -519,13 +626,9 @@ What is the answer to this question: ${objective}`;
       );
     }
 
-    // const newQuery = responseText.split("```")[0].trim();
-
-    // if (this.verboseResponses) {
-    console.log(`Explore query response >>>>\n${responseText}\n<<<<`);
-    // }
-
-    // return newQuery;
+    if (this.verboseResponses) {
+      console.log(`Explore query response >>>>\n${responseText}\n<<<<`);
+    }
 
     return responseText;
   }
@@ -547,33 +650,30 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const response = await openai.createChatCompletion({
-      model: model,
-      messages: [
-        {
-          role: "system",
-          content: evaluateSystem,
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.0,
-      max_tokens: this.maxTokens,
+    const chat = createChat({
+      model,
+      apiKey,
+      maxTokens: this.maxTokens,
     });
 
-    const responseText = response.data.choices[0].message.content;
+    chat.addMessage({
+      role: "system",
+      content: evaluateSystem,
+    });
 
-    const finishReason = response.data.choices[0].finish_reason;
+    const response = await chat.sendMessage(prompt);
+
+    const responseText = response.content.trim();
+
+    const finishReason = response.finishReason;
 
     if (finishReason !== "stop") {
-      console.warn("WARNING: response did not finish");
+      console.warn("WARNING: response did not finish - ", finishReason);
     }
 
-    // if (this.verboseResponses) {
-    console.log("Evaluation response >>>>", responseText);
-    // }
+    if (this.verboseResponses) {
+      console.log("Evaluation response >>>>", responseText);
+    }
 
     if (/insufficient information/i.test(responseText)) {
       return null;
@@ -604,14 +704,13 @@ What is the answer to this question: ${objective}`;
         console.log("result:", result);
       }
       ret = result.records.map((record) => record.toObject());
+      if (ret.length === 0) {
+        queryResultType = QueryResultType.Empty;
+      }
     } catch (error) {
       console.log("error:", error);
       queryResultType = QueryResultType.Error;
       err = error;
-    }
-
-    if (ret.length === 0) {
-      queryResultType = QueryResultType.NoResults;
     }
 
     const attempt: Attempt = {
@@ -660,11 +759,6 @@ const test = async (question: string) => {
 
   console.log("Got result!", inspect(foundResult, false, null, true));
 };
-
-// test("Which item does the Plasma Shrimp corrupt?")
-// test("What color is Razor Wire?")
-// test("What color is Razorwire?")
-// test("What is another item in the same category as Razorwire?")
 
 const question = process.argv[2];
 
