@@ -29,20 +29,60 @@ enum QueryResultType {
   UselessResult,
 }
 
-type Attempt = {
+class Attempt {
   objective: string;
   dbQuery: string;
-  result: any;
+  private resultData: any;
+  private dehydrated: boolean;
   error: any;
   resultType: QueryResultType;
   frozenDiscoveredKnowledge?: string;
-};
+
+  constructor({
+    objective,
+    dbQuery,
+    resultData,
+    error,
+    resultType,
+    frozenDiscoveredKnowledge,
+  }) {
+    this.objective = objective;
+    this.dbQuery = dbQuery;
+    this.resultData = resultData;
+    this.error = error;
+    this.resultType = resultType;
+    this.frozenDiscoveredKnowledge = frozenDiscoveredKnowledge;
+
+    this.dehydrated = false;
+  }
+
+  dehydrate() {
+    this.dehydrated = true;
+    this.resultData = null;
+  }
+
+  async hydrate() {
+    if (!this.dehydrated) {
+      return this.resultData;
+    }
+
+    const session = driver.session();
+    const result = await session.run(this.dbQuery);
+    this.resultData = result.records.map((record) => record.toObject());
+    session.close();
+
+    this.dehydrated = false;
+
+    return this.resultData;
+  }
+}
 
 // We will log all our searches and discoveries into a tree
-type SearchTreeNode = Attempt & {
+type SearchTreeNode = {
   depth: number;
   children: SearchTreeNode[];
   parent: SearchTreeNode | null;
+  attempt: Attempt;
 };
 
 class AttemptSearchTree {
@@ -61,7 +101,7 @@ class AttemptSearchTree {
 
   addNode(attempt: Attempt, parent: SearchTreeNode | null) {
     const newNode = {
-      ...attempt,
+      attempt,
       children: [],
       parent,
       depth: parent ? parent.depth + 1 : 0,
@@ -101,12 +141,26 @@ class AttemptSearchTree {
           // chop all parent references
           if (key === "parent") {
             return undefined;
+          } else if (key === "resultType") {
+            switch (value) {
+              case QueryResultType.Success:
+                return "Success";
+              case QueryResultType.Empty:
+                return "Empty";
+              case QueryResultType.Error:
+                return "Error";
+              case QueryResultType.UselessResult:
+                return "UselessResult";
+              default:
+                return value;
+            }
           }
-          if (key === "result") {
-            if (value) {
+          else if (key === "result") {
+            if (value === null) {
               return "results omitted for performance reasons";
             }
           }
+
           return value;
         },
         2
@@ -121,7 +175,7 @@ class AttemptSearchTree {
    * @returns an unlinked array of the last n nodes
    */
   tail(n: number) {
-    const tail: Attempt[] = [];
+    const tail: SearchTreeNode[] = [];
     let cursor = this.cursor;
     while (cursor && tail.length < n) {
       tail.push({
@@ -171,7 +225,9 @@ already discovered. Prefer case insensitive queries.`;
 const emptySystem =
 `Respond only with valid neo4j cypher queries. DO NOT use labels unless you are sure they exist. DO NOT use 
 relationships unless you are sure that they exist. The data you are looking for is probably not where you think 
-it is and will require looking for relationships that you have not yet discovered. Prefer case insensitive queries.`;
+it is and will require looking for relationships that you have not yet discovered. Prefer case insensitive 
+queries. It is likely that the information is related with more distant relationships than you think or buried 
+in node properties.`;
 
 // prettier-ignore
 const errorSystem =
@@ -182,7 +238,7 @@ const exploreSystem =
 `Help the user discover new information about the knowledge graph in the database. Then tell the user what you 
 have discoverd in a concise way. Your response should be a concise representation of what you discovered.`;
 
-// // prettier-ignore
+// prettier-ignore
 // const newIdeaSystem =
 // `Respond only with valid neo4j cypher queries. DO NOT use labels unless you are sure they exist. DO NOT use
 // relationships unless you are sure that they exist. If you would like to discover if a relationship exists,
@@ -420,7 +476,7 @@ What is the answer to this question: ${objective}`;
 
       // We should check and make sure we are not in a loop here
       if (
-        this.attempts.cursor?.frozenDiscoveredKnowledge ===
+        this.attempts.cursor?.attempt.frozenDiscoveredKnowledge ===
           this.discoveredKnowledge &&
         Agent.isStuckInLoop(dbQuery, this.attempts.cursor)
       ) {
@@ -444,27 +500,27 @@ What is the answer to this question: ${objective}`;
       }
 
       // if the attempt returned a result, evaluate it
-      if (this.attempts.cursor.resultType === QueryResultType.Success) {
+      if (this.attempts.cursor.attempt.resultType === QueryResultType.Success) {
         if (makeQuery) {
           if (this.verboseNeoResults) {
-            console.log(this.attempts.cursor.result);
+            console.log(await this.attempts.cursor.attempt.hydrate());
           }
           foundResult = await this.evaluate();
           if (!foundResult) {
-            this.attempts.cursor.resultType = QueryResultType.UselessResult;
+            this.attempts.cursor.attempt.resultType = QueryResultType.UselessResult;
           }
         }
       } else {
         switch (this.behaviorMode as AgentBehaviorMode) {
           case AgentBehaviorMode.Answer:
-            if (this.attempts.cursor.resultType === QueryResultType.Empty) {
+            if (this.attempts.cursor.attempt.resultType === QueryResultType.Empty) {
               dbQuery = await this.empty();
             } else if (
-              this.attempts.cursor.resultType === QueryResultType.Error
+              this.attempts.cursor.attempt.resultType === QueryResultType.Error
             ) {
               dbQuery = await this.error();
             } else if (
-              this.attempts.cursor.resultType === QueryResultType.UselessResult
+              this.attempts.cursor.attempt.resultType === QueryResultType.UselessResult
             ) {
               // put the agent into explore mode
               this.behaviorMode = AgentBehaviorMode.Explore;
@@ -478,7 +534,7 @@ What is the answer to this question: ${objective}`;
           //   dbQuery = await this.newIdea();
           //   break;
           case AgentBehaviorMode.Explore:
-            if (this.attempts.cursor.resultType === QueryResultType.Error) {
+            if (this.attempts.cursor.attempt.resultType === QueryResultType.Error) {
               dbQuery = await this.error();
               break;
             }
@@ -594,8 +650,8 @@ What is the answer to this question: ${objective}`;
 
     const prompt = Agent.emptyTemplate(
       this.discoveredKnowledge,
-      this.attempts.cursor.objective,
-      this.attempts.cursor.dbQuery
+      this.attempts.cursor.attempt.objective,
+      this.attempts.cursor.attempt.dbQuery
     );
 
     if (this.verbosePrompts) {
@@ -637,8 +693,8 @@ What is the answer to this question: ${objective}`;
     this.debugFlowLog.push("error");
 
     const prompt = Agent.errorTemplate(
-      this.attempts.cursor.dbQuery,
-      this.attempts.cursor.error
+      this.attempts.cursor.attempt.dbQuery,
+      this.attempts.cursor.attempt.error
     );
 
     if (this.verbosePrompts) {
@@ -681,8 +737,8 @@ What is the answer to this question: ${objective}`;
 
     const prompt = Agent.exploreTemplate(
       this.discoveredKnowledge,
-      this.attempts.cursor.objective,
-      this.attempts.cursor.dbQuery
+      this.attempts.cursor.attempt.objective,
+      this.attempts.cursor.attempt.dbQuery
     );
 
     if (this.verbosePrompts) {
@@ -827,13 +883,13 @@ What is the answer to this question: ${objective}`;
   async evaluate() {
     this.debugFlowLog.push("evaluate");
 
-    const resultText = Agent.truncate(this.attempts.cursor.result);
+    const resultText = Agent.truncate(await this.attempts.cursor.attempt.hydrate());
     writeFileSync(`logs/result-${this.queryCount}.json`, resultText);
 
     const prompt = Agent.evaluateTemplate(
-      this.attempts.cursor.dbQuery,
+      this.attempts.cursor.attempt.dbQuery,
       resultText,
-      this.attempts.cursor.objective
+      this.attempts.cursor.attempt.objective
     );
 
     if (this.verbosePrompts) {
@@ -906,14 +962,14 @@ What is the answer to this question: ${objective}`;
       err = error;
     }
 
-    const attempt: Attempt = {
+    const attempt = new Attempt({
       objective,
       dbQuery,
-      result: ret,
+      resultData: ret,
       error: err,
       frozenDiscoveredKnowledge: this.discoveredKnowledge,
       resultType: queryResultType,
-    };
+    });
 
     // This update the cursor
     this.attempts.push(attempt);
@@ -929,11 +985,11 @@ What is the answer to this question: ${objective}`;
     let successes: SearchTreeNode[] = [];
 
     while (cursor) {
-      if (!cursor.resultType) {
+      if (!cursor.attempt.resultType) {
         successes.push(cursor);
       }
 
-      if (cursor.dbQuery === dbQuery) {
+      if (cursor.attempt.dbQuery === dbQuery) {
         return { loopLength, successes };
       }
 
