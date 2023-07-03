@@ -1,12 +1,13 @@
 {
+  "name": "cyllm",
+  "version": "0.1.0",
   "dependencies": {
     "@types/node": "^20.3.2",
+    "antlr4": "^4.13.0",
     "completions": "file:../completions",
+    "dotenv": "^16.3.1",
     "neo4j-driver": "^5.9.2",
     "openai": "^3.3.0",
     "zod": "^3.21.4"
-  },
-  "devDependencies": {
-    "dotenv": "^16.3.1"
   }
 }

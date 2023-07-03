@@ -1,8 +1,9 @@
 // Agent for querying a neo4j database
 
+// IN PROGRESS property checking on created queries for result evaluation (better grounding this way)
 // PRIORITY getting stuck in backtracking loop
-// PRIORITY lazy result storage to avoid memory issues
-// TODO discovered knowledge distillation and pruning
+// PRIORITY switch to streaming debugging logs
+// PRIORITY discovered knowledge distillation and pruning
 // TODO smarter result evaluation
 // TODO setup test suite
 // MINOR figure out how to handle data compartmentalization in the database (neo4j might have something for this)
@@ -15,12 +16,18 @@
 const model = "gpt-3.5-turbo-0613";
 
 import { driver, apiKey } from "./globals";
+import neo4j from "neo4j-driver";
 
 import { inspect } from "util";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { assert } from "console";
 
 import { createChat } from "completions";
+// meh, idk if I like this
+import { MessageOptions } from "completions/dist/createChat";
+import { Awaitable } from "completions/dist/createUserFunction";
+import { allProperties } from "./cypher/utils";
+import { doesPropertyExistAnywhere } from "./dbHelpers";
 
 enum QueryResultType {
   Success,
@@ -28,6 +35,8 @@ enum QueryResultType {
   Error,
   UselessResult,
 }
+
+const verboseRehydration = true;
 
 class Attempt {
   objective: string;
@@ -66,7 +75,11 @@ class Attempt {
       return this.resultData;
     }
 
-    const session = driver.session();
+    if (verboseRehydration) {
+      console.log(`rehydrating data >>>>\n${this.dbQuery}\n<<<<`);
+    }
+
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
     const result = await session.run(this.dbQuery);
     this.resultData = result.records.map((record) => record.toObject());
     session.close();
@@ -154,8 +167,7 @@ class AttemptSearchTree {
               default:
                 return value;
             }
-          }
-          else if (key === "result") {
+          } else if (key === "result") {
             if (value === null) {
               return "results omitted for performance reasons";
             }
@@ -346,7 +358,9 @@ What is the answer to this question: ${objective}`;
 
   ///// Utility functions
 
-  private bindDebugToStaticAsyncFunction = (fn: Function) => {
+  private bindDebugToStaticAsyncFunction = (
+    fn: (...args: any[]) => Awaitable<{ value: any; options?: MessageOptions }>
+  ) => {
     this.debugFlowLog.push(fn.name);
     return async (...args: any[]) => fn(...args);
   };
@@ -361,7 +375,7 @@ What is the answer to this question: ${objective}`;
       console.log(`Label ${oldLabel} was replaced with ${label}`);
     }
 
-    const session = driver.session();
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
     const result =
       await session.run(`CALL apoc.meta.nodeTypeProperties({labels:['${label}']})
     YIELD propertyName
@@ -374,7 +388,9 @@ What is the answer to this question: ${objective}`;
     );
 
     return {
-      property_names: result.records[0].get("propertyNames") as string[],
+      value: {
+        property_names: result.records[0].get("propertyNames") as string[],
+      },
     };
   }
 
@@ -394,7 +410,7 @@ What is the answer to this question: ${objective}`;
       );
     }
 
-    const session = driver.session();
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
     const result = await session.run(`MATCH ()-[r:${relationship}]-()
     RETURN COUNT(r) > 0 as relationshipExists`);
     session.close();
@@ -405,9 +421,11 @@ What is the answer to this question: ${objective}`;
     );
 
     return {
-      relationship_count: result.records[0].get(
-        "relationshipExists"
-      ) as boolean,
+      value: {
+        relationship_count: result.records[0].get(
+          "relationshipExists"
+        ) as boolean,
+      },
     };
   }
 
@@ -431,7 +449,7 @@ What is the answer to this question: ${objective}`;
   verbosePrompts: boolean = false;
   verboseResponses: boolean = false;
   verboseQuerying: boolean = false;
-  verboseFailureTypes: boolean = true;
+  verboseResultFailures: boolean = true;
   verboseNeoResults: boolean = false;
 
   labels: string[];
@@ -506,21 +524,62 @@ What is the answer to this question: ${objective}`;
             console.log(await this.attempts.cursor.attempt.hydrate());
           }
           foundResult = await this.evaluate();
-          if (!foundResult) {
-            this.attempts.cursor.attempt.resultType = QueryResultType.UselessResult;
+          if (foundResult) {
+            // check and make sure all the properties actually exist somewhere in the graph
+            try {
+              const properties = allProperties(
+                this.attempts.cursor.attempt.dbQuery
+              );
+              // If we are using properties that don't exist anywhere this is probably garbage
+              try {
+                if (
+                  !(
+                    await Promise.all(
+                      Array.from(properties).map(async (property) => {
+                        return await doesPropertyExistAnywhere(property);
+                      })
+                    )
+                  ).every((exists) => exists)
+                ) {
+                  if (this.verboseResultFailures) {
+                    console.log(
+                      `Got result >>>> ${foundResult}\nQuery used non-existent properties - discarding result`
+                    );
+                  }
+                  foundResult = null;
+                  this.attempts.cursor.attempt.resultType =
+                    QueryResultType.UselessResult;
+                }
+              } catch (error) {
+                console.log("db error", error);
+              }
+            } catch (error) {
+              console.log(
+                "Invalid cypher parse !!! VERY BAD - FIX ME !!!",
+                error
+              );
+              foundResult = null;
+            }
+          } else {
+            this.attempts.cursor.attempt.resultType =
+              QueryResultType.UselessResult;
           }
+          this.attempts.cursor.attempt.dehydrate();
         }
       } else {
         switch (this.behaviorMode as AgentBehaviorMode) {
           case AgentBehaviorMode.Answer:
-            if (this.attempts.cursor.attempt.resultType === QueryResultType.Empty) {
+            if (
+              this.attempts.cursor.attempt.resultType === QueryResultType.Empty
+            ) {
               dbQuery = await this.empty();
             } else if (
               this.attempts.cursor.attempt.resultType === QueryResultType.Error
             ) {
               dbQuery = await this.error();
             } else if (
-              this.attempts.cursor.attempt.resultType === QueryResultType.UselessResult
+              this.attempts.cursor.attempt.resultType ===
+              QueryResultType.UselessResult
             ) {
               // put the agent into explore mode
               this.behaviorMode = AgentBehaviorMode.Explore;
@@ -534,7 +593,9 @@ What is the answer to this question: ${objective}`;
           //   dbQuery = await this.newIdea();
           //   break;
           case AgentBehaviorMode.Explore:
-            if (this.attempts.cursor.attempt.resultType === QueryResultType.Error) {
+            if (
+              this.attempts.cursor.attempt.resultType === QueryResultType.Error
+            ) {
               dbQuery = await this.error();
               break;
             }
@@ -559,7 +620,7 @@ What is the answer to this question: ${objective}`;
 
     // Discover initial information about the knowledge graph
     // get all the kinds of nodes and relationships in the graph
-    const session = driver.session();
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
     const labelsResult = await session.run(
       `MATCH (n) RETURN DISTINCT labels(n) AS labels`
     );
@@ -883,7 +944,9 @@ What is the answer to this question: ${objective}`;
   async evaluate() {
     this.debugFlowLog.push("evaluate");
 
-    const resultText = Agent.truncate(await this.attempts.cursor.attempt.hydrate());
+    const resultText = Agent.truncate(
+      await this.attempts.cursor.attempt.hydrate()
+    );
     writeFileSync(`logs/result-${this.queryCount}.json`, resultText);
 
     const prompt = Agent.evaluateTemplate(
@@ -918,9 +981,9 @@ What is the answer to this question: ${objective}`;
       console.warn("WARNING: response did not finish - ", finishReason);
     }
 
-    // if (this.verboseResponses) {
-    console.log("Evaluation response >>>>", responseText);
-    // }
+    if (this.verboseResponses) {
+      console.log("Evaluation response >>>>", responseText);
+    }
 
     if (/insufficient information/i.test(responseText)) {
       return null;
@@ -946,7 +1009,7 @@ What is the answer to this question: ${objective}`;
     let queryResultType = QueryResultType.Success;
 
     try {
-      const session = driver.session();
+      const session = driver.session({ defaultAccessMode: neo4j.session.READ });
       const result = await session.run(dbQuery);
       session.close();
       if (this.verboseQuerying) {
@@ -1003,6 +1066,8 @@ What is the answer to this question: ${objective}`;
   //// Debug stuff
 
   dumpState() {
+    const cwd = process.cwd();
+    console.log(`Dumping state to ${cwd}/debug`);
     // ensure debug directory exists
     if (!existsSync("debug")) mkdirSync("debug", { recursive: true });
     writeFileSync("debug/async_calls", this.debugFlowLog.join("\n"));
@@ -1011,27 +1076,4 @@ What is the answer to this question: ${objective}`;
   }
 }
 
-const test = async (question: string) => {
-  const agent = new Agent();
-
-  process.on("SIGINT", () => {
-    // dump agent state to files and exit
-    console.log("SIGINT received, dumping agent state to files and exiting");
-    agent.dumpState();
-    process.exit(1);
-  });
-
-  const foundResult = await agent.ask(question);
-
-  console.log("Got result!", inspect(foundResult, false, null, true));
-  agent.dumpState();
-};
-
-// make sure that logs directory exists
-if (!existsSync("logs")) mkdirSync("logs", { recursive: true });
-
-const question = process.argv[2];
-
-test(question)
-  .catch(console.error)
-  .then(() => driver.close());
+export default Agent;

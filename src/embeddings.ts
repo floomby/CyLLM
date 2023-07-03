@@ -14,9 +14,16 @@ const computeEmbedding = async (input: string) => {
 // While ada-002 returns unit vectors our centroids are not necessarily a unit vector
 const computeSimilarity = (embedding1: number[], embedding2: number[]) => {
   // cosine similarity
-  const dotProduct = embedding1.reduce((acc, val, i) => acc + val * embedding2[i], 0);
-  const magnitude1 = Math.sqrt(embedding1.reduce((acc, val) => acc + val * val, 0));
-  const magnitude2 = Math.sqrt(embedding2.reduce((acc, val) => acc + val * val, 0));
+  const dotProduct = embedding1.reduce(
+    (acc, val, i) => acc + val * embedding2[i],
+    0
+  );
+  const magnitude1 = Math.sqrt(
+    embedding1.reduce((acc, val) => acc + val * val, 0)
+  );
+  const magnitude2 = Math.sqrt(
+    embedding2.reduce((acc, val) => acc + val * val, 0)
+  );
   const similarity = dotProduct / (magnitude1 * magnitude2);
   return similarity;
 };
@@ -34,4 +41,4 @@ const normalize = (vector: number[]) => {
   return vector.map((val) => val / magnitude);
 };
 
-export { computeEmbedding, computeSimilarity, computeCentroid };
+export { computeEmbedding, computeSimilarity, computeCentroid, normalize };
