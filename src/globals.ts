@@ -12,8 +12,8 @@ const configuration = new Configuration({
 const openai = new OpenAIApi(configuration);
 
 const driver = neo4j.driver(
-  "bolt://127.0.0.1:7687",
-  neo4j.auth.basic("neo4j", "charliepassword")
+  process.env.DB_URL,
+  neo4j.auth.basic(process.env.DB_USER, process.env.DB_PASSWORD)
 );
 
 export { openai, driver, apiKey };
