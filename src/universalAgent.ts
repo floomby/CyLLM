@@ -1,24 +1,23 @@
-// Agent for querying a neo4j database
+// Generic agent for querying a neo4j database
 
-// PRIORITY getting stuck in backtracking loop sometimes
-// PRIORITY discovered knowledge distillation and pruning
-// TODO switch to streaming debugging logs
+// TODO getting stuck in backtracking loop sometimes
+// TODO knowledge distillation and pruning
 // TODO smarter result evaluation
 // TODO setup test suite
 // MINOR figure out how to handle data compartmentalization in the database (neo4j might have something for this)
 // MINOR gracefully handle neo4j db errors (not query errors, we got these covered)
 
-// Ideas to improve performance:
-// - Creating summary nodes synthetically, calculating embeddings on them and using them as a reference point for the agent
-// - Creation of text indices (done) and using fuzzy matching to find nodes (not done)
-
-const model = "gpt-3.5-turbo-0613";
-
 import { driver, apiKey } from "./globals";
 import neo4j from "neo4j-driver";
 
 import { inspect } from "util";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
+import {
+  WriteStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+} from "fs";
 import { assert } from "console";
 
 import { createChat } from "completions";
@@ -27,198 +26,8 @@ import { MessageOptions } from "completions/dist/createChat";
 import { Awaitable } from "completions/dist/createUserFunction";
 import { allProperties } from "./cypher/utils";
 import { doesPropertyExistAnywhere } from "./dbHelpers";
-
-enum QueryResultType {
-  Success,
-  Empty,
-  Error,
-  UselessResult,
-}
-
-const verboseRehydration = true;
-
-class Attempt {
-  objective: string;
-  dbQuery: string;
-  private resultData: any;
-  private dehydrated: boolean;
-  error: any;
-  resultType: QueryResultType;
-  frozenDiscoveredKnowledge?: string;
-
-  constructor({
-    objective,
-    dbQuery,
-    resultData,
-    error,
-    resultType,
-    frozenDiscoveredKnowledge,
-  }) {
-    this.objective = objective;
-    this.dbQuery = dbQuery;
-    this.resultData = resultData;
-    this.error = error;
-    this.resultType = resultType;
-    this.frozenDiscoveredKnowledge = frozenDiscoveredKnowledge;
-
-    this.dehydrated = false;
-  }
-
-  dehydrate() {
-    this.dehydrated = true;
-    this.resultData = null;
-  }
-
-  async hydrate() {
-    if (!this.dehydrated) {
-      return this.resultData;
-    }
-
-    if (verboseRehydration) {
-      console.log(`rehydrating data >>>>\n${this.dbQuery}\n<<<<`);
-    }
-
-    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
-    const result = await session.run(this.dbQuery);
-    this.resultData = result.records.map((record) => record.toObject());
-    session.close();
-
-    this.dehydrated = false;
-
-    return this.resultData;
-  }
-}
-
-// We will log all our searches and discoveries into a tree
-type SearchTreeNode = {
-  depth: number;
-  children: SearchTreeNode[];
-  parent: SearchTreeNode | null;
-  attempt: Attempt;
-};
-
-class AttemptSearchTree {
-  root: SearchTreeNode | null = null;
-  previousQueries: Map<string, SearchTreeNode[]> = new Map();
-  useMap: boolean = false;
-
-  constructor(useMap: boolean = false) {
-    this.useMap = useMap;
-    if (useMap) {
-      this.previousQueries = new Map();
-    }
-  }
-
-  cursor: SearchTreeNode | null = null;
-
-  addNode(attempt: Attempt, parent: SearchTreeNode | null) {
-    const newNode = {
-      attempt,
-      children: [],
-      parent,
-      depth: parent ? parent.depth + 1 : 0,
-    };
-
-    if (!this.root) {
-      this.root = newNode;
-      this.cursor = newNode;
-    } else {
-      parent.children.push(newNode);
-    }
-
-    if (this.useMap) {
-      const previousQueries = this.previousQueries.get(attempt.dbQuery);
-      if (previousQueries) {
-        previousQueries.push(newNode);
-      } else {
-        this.previousQueries.set(attempt.dbQuery, [newNode]);
-      }
-    }
-
-    return newNode;
-  }
-
-  // append at the cursor as if this was a linked list
-  push(attempt: Attempt) {
-    this.cursor = this.addNode(attempt, this.cursor);
-    return this.cursor;
-  }
-
-  dumpToFile(filename: string) {
-    writeFileSync(
-      filename,
-      JSON.stringify(
-        this.root,
-        (key, value) => {
-          // chop all parent references
-          if (key === "parent") {
-            return undefined;
-          } else if (key === "resultType") {
-            switch (value) {
-              case QueryResultType.Success:
-                return "Success";
-              case QueryResultType.Empty:
-                return "Empty";
-              case QueryResultType.Error:
-                return "Error";
-              case QueryResultType.UselessResult:
-                return "UselessResult";
-              default:
-                return value;
-            }
-          } else if (key === "result") {
-            if (value === null) {
-              return "results omitted for performance reasons";
-            }
-          }
-
-          return value;
-        },
-        2
-      )
-    );
-  }
-
-  /**
-   * Get the last n parent nodes of the cursor
-   *
-   * @param n number of nodes to return
-   * @returns an unlinked array of the last n nodes
-   */
-  tail(n: number) {
-    const tail: SearchTreeNode[] = [];
-    let cursor = this.cursor;
-    while (cursor && tail.length < n) {
-      tail.push({
-        ...cursor,
-      });
-      const last = tail[tail.length - 1];
-      delete (last as SearchTreeNode).children;
-      delete (last as SearchTreeNode).parent;
-      cursor = cursor.parent;
-    }
-    return tail.reverse();
-  }
-
-  lastBacktrackLocation: SearchTreeNode | null = null;
-
-  /**
-   * Backtrack the cursor n nodes
-   *
-   * @param n number of nodes to backtrack, if undefined then backtrack to the root
-   * @returns the new cursor
-   */
-  backtrack(n?: number) {
-    if (n === undefined) {
-      this.cursor = this.root;
-    }
-    for (let i = 0; i < n; i++) {
-      this.cursor = this.cursor?.parent || null;
-    }
-    this.lastBacktrackLocation = this.cursor;
-    return this.cursor;
-  }
-}
+import { AgentBase, AgentOptions, Attempt, QueryResultType } from "./agentBase";
+import { AttemptSearchTree, SearchTreeNode } from "./searchTree";
 
 enum AgentBehaviorMode {
   Ready,
@@ -263,7 +72,7 @@ const evaluateSystem =
 answer to the question, respond with the answer. Otherwise, respond by saying "insufficient information". 
 DO NOT hallucinate. DO NOT rely on internal knowledge. ONLY base the answer on the provided information.`;
 
-class Agent {
+export default class UniversalAgent extends AgentBase {
   ///// Prompt templates
   private static initialTemplate(
     discoveredKnowledge: string,
@@ -355,130 +164,28 @@ ${result}
 What is the answer to this question: ${objective}`;
   }
 
-  ///// Utility functions
-
-  private bindDebugToStaticAsyncFunction = (
-    fn: (...args: any[]) => Awaitable<{ value: any; options?: MessageOptions }>
-  ) => {
-    this.debugFlowLog.push(fn.name);
-    return async (...args: any[]) => fn(...args);
-  };
-
-  private static async getAllProperties({ label }: { label: string }) {
-    console.log("CALLED FUNCTION: getAllProperties", { label });
-
-    // remove quotes from label if they exist
-    const oldLabel = label;
-    label = label.replace(/"/g, "").replace(/'/g, "");
-    if (oldLabel !== label) {
-      console.log(`Label ${oldLabel} was replaced with ${label}`);
-    }
-
-    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
-    const result =
-      await session.run(`CALL apoc.meta.nodeTypeProperties({labels:['${label}']})
-    YIELD propertyName
-    RETURN collect(distinct propertyName) as propertyNames`);
-    session.close();
-
-    console.log(
-      "getAllProperties result",
-      result.records[0].get("propertyNames")
-    );
-
-    return {
-      value: {
-        property_names: result.records[0].get("propertyNames") as string[],
-      },
-    };
-  }
-
-  private static async doesRelationshipExist({
-    relationship,
-  }: {
-    relationship: string;
-  }) {
-    console.log("CALLED FUNCTION: doesRelationshipExist", { relationship });
-
-    // remove quotes from relationship if they exist
-    const oldRelationship = relationship;
-    relationship = relationship.replace(/"/g, "").replace(/'/g, "");
-    if (oldRelationship !== relationship) {
-      console.log(
-        `Relationship ${oldRelationship} was replaced with ${relationship}`
-      );
-    }
-
-    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
-    const result = await session.run(`MATCH ()-[r:${relationship}]-()
-    RETURN COUNT(r) > 0 as relationshipExists`);
-    session.close();
-
-    console.log(
-      "doesRelationshipExist result",
-      result.records[0].get("relationshipExists")
-    );
-
-    return {
-      value: {
-        relationship_count: result.records[0].get(
-          "relationshipExists"
-        ) as boolean,
-      },
-    };
-  }
-
-  // TODO Work on knowledge distillation
-  private static async reformulateDiscovery(discovery: string) {
-    const chat = createChat({
-      model,
-      apiKey,
-      unresponsiveApiTimeout: 5000,
-    });
-
-    const response = await chat.sendMessage(
-      `Reformulate this discovery into a concise note.\n\n======\n${discovery}\n======\n`
-    );
-
-    return response.content.trim();
-  }
-
   ///// Agent state
 
-  verbosePrompts: boolean = false;
-  verboseResponses: boolean = false;
-  verboseQuerying: boolean = false;
-  verboseResultFailures: boolean = true;
-  verboseNeoResults: boolean = false;
-
-  labels: string[];
-  relationshipTypes: string[];
-
-  discoveredKnowledge: string = "";
-
-  attempts = new AttemptSearchTree();
-
-  maxTokens: number | undefined = undefined;
   behaviorMode: AgentBehaviorMode = AgentBehaviorMode.Answer;
 
-  debugFlowLog: string[] = [];
+  constructor(options: AgentOptions = {}) {
+    super(options);
 
-  constructor() {
     // TODO replace with async static factory
     this.behaviorMode = AgentBehaviorMode.Ready;
-    this.debugFlowLog.push("switched to ready mode");
+    this.debugFlowLog?.write("switched to ready mode\n");
     this.discoveredKnowledge = "No knowledge discovered yet.";
   }
 
-  async ask(question: string) {
-    this.debugFlowLog.push("ask");
+  async run(input: string) {
+    this.debugFlowLog?.write("ask\n");
 
     if (this.behaviorMode !== AgentBehaviorMode.Ready) {
       throw new Error("Agent is not ready to answer questions.");
     }
 
     // Initial query to get started
-    let dbQuery = await this.initial(question);
+    let dbQuery = await this.initial(input);
     let foundResult: string | null = null;
 
     // Agent processing loop (this is confusing stated stuff)
@@ -495,31 +202,31 @@ What is the answer to this question: ${objective}`;
       if (
         this.attempts.cursor?.attempt.frozenDiscoveredKnowledge ===
           this.discoveredKnowledge &&
-        Agent.isStuckInLoop(dbQuery, this.attempts.cursor)
+        UniversalAgent.isStuckInLoop(dbQuery, this.attempts.cursor)
       ) {
-        this.debugFlowLog.push("stuck in loop");
+        this.debugFlowLog?.write("stuck in loop\n");
         // We need to switch to explore mode
         if (
           (this.behaviorMode as AgentBehaviorMode) === AgentBehaviorMode.Answer
         ) {
           this.behaviorMode = AgentBehaviorMode.Explore;
-          this.debugFlowLog.push("switched to explore mode");
+          this.debugFlowLog?.write("switched to explore mode\n");
           makeQuery = false;
         } else {
           // backtrack to start keeping the new knowledge
           this.attempts.backtrack();
-          this.debugFlowLog.push("backtracked to root");
+          this.debugFlowLog?.write("backtracked to root\n");
         }
       }
 
       if (makeQuery) {
-        await this.runQuery(dbQuery, question);
+        await this.runQuery(dbQuery, input);
       }
 
       // if the attempt returned a result, evaluate it
       if (this.attempts.cursor.attempt.resultType === QueryResultType.Success) {
         if (makeQuery) {
-          if (this.verboseNeoResults) {
+          if (this.options.verboseNeoResults) {
             console.log(await this.attempts.cursor.attempt.hydrate());
           }
           foundResult = await this.evaluate();
@@ -540,7 +247,7 @@ What is the answer to this question: ${objective}`;
                     )
                   ).every((exists) => exists)
                 ) {
-                  if (this.verboseResultFailures) {
+                  if (this.options.verboseResultFailures) {
                     console.log(
                       `Got result >>>> ${foundResult}\nQuery used non-existent properties - discarding result`
                     );
@@ -582,7 +289,7 @@ What is the answer to this question: ${objective}`;
             ) {
               // put the agent into explore mode
               this.behaviorMode = AgentBehaviorMode.Explore;
-              this.debugFlowLog.push("switched to explore mode");
+              this.debugFlowLog?.write("switched to explore mode\n");
             } else {
               console.log("attempts", this.attempts.tail(1));
               throw new Error("Agent is in an invalid state.");
@@ -602,7 +309,7 @@ What is the answer to this question: ${objective}`;
             // this.discoveredKnowledge += `\n${await Agent.reformulateDiscovery(discovery)}`;
             this.discoveredKnowledge += `\n${discovery}`;
             this.behaviorMode = AgentBehaviorMode.Answer;
-            this.debugFlowLog.push("switched to answer mode");
+            this.debugFlowLog?.write("switched to answer mode\n");
             break;
           default:
             throw new Error("Agent is in an invalid state.");
@@ -615,7 +322,7 @@ What is the answer to this question: ${objective}`;
 
   // Entry point for the agent to set up some of its state and get a starting query
   private async initial(objective: string) {
-    this.debugFlowLog.push("initial");
+    this.debugFlowLog?.write("initial\n");
 
     // Discover initial information about the knowledge graph
     // get all the kinds of nodes and relationships in the graph
@@ -634,27 +341,27 @@ What is the answer to this question: ${objective}`;
       record.get("relationshipType")
     );
 
-    this.labels = labels;
-    this.relationshipTypes = relationshipTypes;
-
     // prettier-ignore
     this.discoveredKnowledge =
       `labels: ${labels.join(", ")}\nrelationship types: ${relationshipTypes.join(", ")}`;
     this.behaviorMode = AgentBehaviorMode.Answer;
-    this.debugFlowLog.push("switched to answer mode");
+    this.debugFlowLog?.write("switched to answer mode\n");
 
     session.close();
 
-    const prompt = Agent.initialTemplate(this.discoveredKnowledge, objective);
+    const prompt = UniversalAgent.initialTemplate(
+      this.discoveredKnowledge,
+      objective
+    );
 
-    if (this.verbosePrompts) {
+    if (this.options.verbosePrompts) {
       console.log("prompt:", prompt);
     }
 
     const chat = createChat({
-      model,
+      model: this.options.model,
       apiKey,
-      maxTokens: this.maxTokens,
+      maxTokens: this.options.maxTokens,
       unresponsiveApiTimeout: 5000,
       // Seems to do worse with this function
       // functions: [
@@ -694,7 +401,7 @@ What is the answer to this question: ${objective}`;
       console.warn("WARNING: response did not finish - ", finishReason);
     }
 
-    if (this.verboseResponses) {
+    if (this.options.verboseResponses) {
       console.log(`Initial query response >>>>\n${responseText}\n<<<<`);
     }
 
@@ -706,22 +413,22 @@ What is the answer to this question: ${objective}`;
   // When we get noting back from the database, we need to ask the agent to try and figure out why
   // NOTE This is not for if there is an error
   private async empty() {
-    this.debugFlowLog.push("empty");
+    this.debugFlowLog?.write("empty\n");
 
-    const prompt = Agent.emptyTemplate(
+    const prompt = UniversalAgent.emptyTemplate(
       this.discoveredKnowledge,
       this.attempts.cursor.attempt.objective,
       this.attempts.cursor.attempt.dbQuery
     );
 
-    if (this.verbosePrompts) {
+    if (this.options.verbosePrompts) {
       console.log("prompt:", prompt);
     }
 
     const chat = createChat({
-      model,
+      model: this.options.model,
       apiKey,
-      maxTokens: this.maxTokens,
+      maxTokens: this.options.maxTokens,
       unresponsiveApiTimeout: 5000,
     });
 
@@ -742,7 +449,7 @@ What is the answer to this question: ${objective}`;
 
     const newQuery = responseText.split("```")[0].trim();
 
-    if (this.verboseResponses) {
+    if (this.options.verboseResponses) {
       console.log(`New query response >>>>\n${responseText}\n<<<<`);
     }
 
@@ -750,21 +457,21 @@ What is the answer to this question: ${objective}`;
   }
 
   async error() {
-    this.debugFlowLog.push("error");
+    this.debugFlowLog?.write("error\n");
 
-    const prompt = Agent.errorTemplate(
+    const prompt = UniversalAgent.errorTemplate(
       this.attempts.cursor.attempt.dbQuery,
       this.attempts.cursor.attempt.error
     );
 
-    if (this.verbosePrompts) {
+    if (this.options.verbosePrompts) {
       console.log("prompt:", prompt);
     }
 
     const chat = createChat({
-      model,
+      model: this.options.model,
       apiKey,
-      maxTokens: this.maxTokens,
+      maxTokens: this.options.maxTokens,
       unresponsiveApiTimeout: 5000,
     });
 
@@ -785,7 +492,7 @@ What is the answer to this question: ${objective}`;
 
     const newQuery = responseText.split("```")[0].trim();
 
-    if (this.verboseResponses) {
+    if (this.options.verboseResponses) {
       console.log(`New query (error fix) response >>>>\n${responseText}\n<<<<`);
     }
 
@@ -793,23 +500,23 @@ What is the answer to this question: ${objective}`;
   }
 
   async explore() {
-    this.debugFlowLog.push("explore");
+    this.debugFlowLog?.write("explore\n");
 
-    const prompt = Agent.exploreTemplate(
+    const prompt = UniversalAgent.exploreTemplate(
       this.discoveredKnowledge,
       this.attempts.cursor.attempt.objective,
       this.attempts.cursor.attempt.dbQuery
     );
 
-    if (this.verbosePrompts) {
+    if (this.options.verbosePrompts) {
       console.log("prompt:", prompt);
     }
 
     const chat = createChat({
-      model,
+      model: this.options.model,
       apiKey,
       temperature: 0.2,
-      maxTokens: this.maxTokens,
+      maxTokens: this.options.maxTokens,
       unresponsiveApiTimeout: 5000,
       functions: [
         {
@@ -827,7 +534,7 @@ What is the answer to this question: ${objective}`;
             },
             required: ["label"],
           },
-          function: this.bindDebugToStaticAsyncFunction(Agent.getAllProperties),
+          function: this.getAllProperties,
         },
         {
           name: "does_relationship_exist",
@@ -843,9 +550,7 @@ What is the answer to this question: ${objective}`;
             },
             required: ["relationship"],
           },
-          function: this.bindDebugToStaticAsyncFunction(
-            Agent.doesRelationshipExist
-          ),
+          function: this.doesRelationshipExist,
         },
       ],
       functionCall: "auto",
@@ -867,101 +572,35 @@ What is the answer to this question: ${objective}`;
       );
     }
 
-    if (this.verboseResponses) {
+    if (this.options.verboseResponses) {
       console.log(`Explore query response >>>>\n${responseText}\n<<<<`);
     }
 
     return responseText;
   }
 
-  private static replacer(key: string, value: any) {
-    // removed all elementId
-    if (key === "elementId") {
-      // one more check to make sure we really only get what we want
-      if (typeof value === "string" && /^\d+:[a-f0-9\-]+:\d+$/.test(value)) {
-        return undefined;
-      }
-      return value;
-    }
-    // replace all identity with the actual node id
-    if (key === "identity") {
-      if ("low" in value && "high" in value) {
-        // convert to a string (neo4j has overridden this)
-        return value.toString();
-      }
-    }
-    return value;
-  }
-
-  private static truncate(result: any) {
-    let resultText = JSON.stringify(result, Agent.replacer, 2);
-
-    let didSloppyTruncation = false;
-    let needsCleanTruncation = false;
-    let finalCount = 0;
-    let initialCount = undefined;
-
-    while (resultText.length > 1000 && !didSloppyTruncation) {
-      const parsed = JSON.parse(resultText);
-
-      let needsSloppyTruncation = false;
-
-      if (Array.isArray(parsed)) {
-        // cut in half
-        if (initialCount === undefined) {
-          initialCount = parsed.length;
-        }
-        if (parsed.length > 2) {
-          parsed.splice(Math.floor(parsed.length / 2));
-          finalCount = parsed.length;
-          resultText = JSON.stringify(parsed, null, 2);
-          needsCleanTruncation = true;
-        } else {
-          needsSloppyTruncation = true;
-        }
-      } else {
-        needsSloppyTruncation = true;
-      }
-
-      if (needsSloppyTruncation) {
-        // sloppy truncation
-        resultText = resultText.slice(0, 1000);
-        resultText += "\n...TRUNCATED...\n";
-        didSloppyTruncation = true;
-      }
-    }
-
-    if (!didSloppyTruncation && needsCleanTruncation) {
-      // chop the last bracket off and add ellipses
-      resultText = resultText.slice(0, -1);
-      resultText += `  ... ${initialCount - finalCount} more items\n]`;
-    }
-
-    return resultText;
-  }
-
   async evaluate() {
-    this.debugFlowLog.push("evaluate");
+    this.debugFlowLog?.write("evaluate\n");
 
-    const resultText = Agent.truncate(
+    const resultText = UniversalAgent.truncate(
       await this.attempts.cursor.attempt.hydrate()
     );
     writeFileSync(`logs/result-${this.queryCount}.json`, resultText);
 
-    const prompt = Agent.evaluateTemplate(
+    const prompt = UniversalAgent.evaluateTemplate(
       this.attempts.cursor.attempt.dbQuery,
       resultText,
       this.attempts.cursor.attempt.objective
     );
 
-    if (this.verbosePrompts) {
+    if (this.options.verbosePrompts) {
       console.log("prompt:", prompt);
     }
 
     const chat = createChat({
-      model,
+      model: this.options.model,
       apiKey,
-      maxTokens: this.maxTokens,
+      maxTokens: this.options.maxTokens,
       unresponsiveApiTimeout: 5000,
     });
 
@@ -980,7 +619,7 @@ What is the answer to this question: ${objective}`;
       console.warn("WARNING: response did not finish - ", finishReason);
     }
 
-    if (this.verboseResponses) {
+    if (this.options.verboseResponses) {
       console.log("Evaluation response >>>>", responseText);
     }
 
@@ -989,54 +628,6 @@ What is the answer to this question: ${objective}`;
     }
 
     return responseText;
-  }
-
-  ///// Neo4j query evaluation and knowledge extraction
-
-  queryCount: number = 0;
-
-  async runQuery(dbQuery: string, objective: string) {
-    this.debugFlowLog.push("runQuery");
-
-    console.log(
-      `dbQuery (${this.queryCount++}) >>>>>>\n${dbQuery}\n<<<<<< dbQuery`
-    );
-
-    let ret: any = null;
-    let err: any = null;
-
-    let queryResultType = QueryResultType.Success;
-
-    try {
-      const session = driver.session({ defaultAccessMode: neo4j.session.READ });
-      const result = await session.run(dbQuery);
-      session.close();
-      if (this.verboseQuerying) {
-        console.log("result:", result);
-      }
-      ret = result.records.map((record) => record.toObject());
-      if (ret.length === 0) {
-        queryResultType = QueryResultType.Empty;
-      }
-    } catch (error) {
-      console.log("error:", error);
-      queryResultType = QueryResultType.Error;
-      err = error;
-    }
-
-    const attempt = new Attempt({
-      objective,
-      dbQuery,
-      resultData: ret,
-      error: err,
-      frozenDiscoveredKnowledge: this.discoveredKnowledge,
-      resultType: queryResultType,
-    });
-
-    // This update the cursor
-    this.attempts.push(attempt);
-
-    return attempt;
   }
 
   // If we are stuck in a loop of failures we need to switch modes
@@ -1063,16 +654,4 @@ What is the answer to this question: ${objective}`;
   }
 
   //// Debug stuff
-
-  dumpState() {
-    const cwd = process.cwd();
-    console.log(`Dumping state to ${cwd}/debug`);
-    // ensure debug directory exists
-    if (!existsSync("debug")) mkdirSync("debug", { recursive: true });
-    writeFileSync("debug/async_calls", this.debugFlowLog.join("\n"));
-    writeFileSync("debug/knowledge", this.discoveredKnowledge);
-    this.attempts.dumpToFile("debug/search_tree.json");
-  }
 }
-
-export default Agent;

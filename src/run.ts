@@ -6,10 +6,12 @@
 
 import { existsSync, mkdirSync } from "fs";
 import { driver } from "./globals";
-import Agent from "./agent";
+import UniversalAgent from "./universalAgent";
 
 const run = async (question: string) => {
-  const agent = new Agent();
+  const agent = new UniversalAgent({
+    debugFlowLogFilename: "debug/async_calls",
+  });
 
   process.on("SIGINT", () => {
     // dump agent state to files and exit
@@ -18,7 +20,7 @@ const run = async (question: string) => {
     process.exit(1);
   });
 
-  const foundResult = await agent.ask(question);
+  const foundResult = await agent.run(question);
 
   console.log("Got result!", foundResult);
   agent.dumpState();
