@@ -1,15 +1,14 @@
 // Agent for querying a neo4j database
 
-// IN PROGRESS property checking on created queries for result evaluation (better grounding this way)
-// PRIORITY getting stuck in backtracking loop
-// PRIORITY switch to streaming debugging logs
+// PRIORITY getting stuck in backtracking loop sometimes
 // PRIORITY discovered knowledge distillation and pruning
+// TODO switch to streaming debugging logs
 // TODO smarter result evaluation
 // TODO setup test suite
 // MINOR figure out how to handle data compartmentalization in the database (neo4j might have something for this)
 // MINOR gracefully handle neo4j db errors (not query errors, we got these covered)
 
-// Ideas:
+// Ideas to improve performance:
 // - Creating summary nodes synthetically, calculating embeddings on them and using them as a reference point for the agent
 // - Creation of text indices (done) and using fuzzy matching to find nodes (not done)
 
