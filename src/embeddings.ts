@@ -1,12 +1,12 @@
 import { openai } from "./globals";
 
 const computeEmbedding = async (input: string) => {
-  const response = await openai.createEmbedding({
+  const response = await openai.embeddings.create({
     model: "text-embedding-ada-002",
     input,
   });
 
-  return response.data.data[0].embedding;
+  return response.data[0].embedding;
 };
 
 // TODO convert all these to loops for performance

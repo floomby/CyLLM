@@ -1,5 +1,6 @@
 // Generic agent for querying a neo4j database
 
+// IN PROGRESS switch over to the original sdk
 // TODO getting stuck in backtracking loop sometimes
 // TODO knowledge distillation and pruning
 // TODO smarter result evaluation
@@ -7,7 +8,7 @@
 // MINOR figure out how to handle data compartmentalization in the database (neo4j might have something for this)
 // MINOR gracefully handle neo4j db errors (not query errors, we got these covered)
 
-import { driver, apiKey } from "./globals";
+import { driver, openai } from "./globals";
 import neo4j from "neo4j-driver";
 
 import { inspect } from "util";
@@ -20,14 +21,14 @@ import {
 } from "fs";
 import { assert } from "console";
 
-import { createChat } from "completions";
-// meh, idk if I like this
-import { MessageOptions } from "completions/dist/createChat";
-import { Awaitable } from "completions/dist/createUserFunction";
 import { allProperties } from "./cypher/utils";
 import { doesPropertyExistAnywhere } from "./dbHelpers";
 import { AgentBase, AgentOptions, Attempt, QueryResultType } from "./agentBase";
 import { AttemptSearchTree, SearchTreeNode } from "./searchTree";
+import {
+  ChatCompletion,
+  CompletionCreateParams,
+} from "openai/resources/chat/completions";
 
 enum AgentBehaviorMode {
   Ready,
@@ -358,44 +359,24 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const chat = createChat({
+    const response = await openai.chat.completions.create({
       model: this.options.model,
-      apiKey,
-      maxTokens: this.options.maxTokens,
-      unresponsiveApiTimeout: 5000,
-      // Seems to do worse with this function
-      // functions: [
-      //   {
-      //     name: "get_all_properties",
-      //     description:
-      //       "Returns all possible properties for a node with a given label",
-      //     parameters: {
-      //       type: "object",
-      //       properties: {
-      //         label: {
-      //           type: "string",
-      //           description:
-      //             "The label (kind) of node to get possible properties for",
-      //         },
-      //       },
-      //       required: ["label"],
-      //     },
-      //     function: this.bindDebugToStaticAsyncFunction(Agent.getAllProperties),
-      //   },
-      // ],
-      // functionCall: "auto",
+      max_tokens: this.options.maxTokens,
+      messages: [
+        {
+          role: "system",
+          content: initialSystem,
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
     });
 
-    chat.addMessage({
-      role: "system",
-      content: initialSystem,
-    });
+    const responseText = response.choices[0].message.content.trim();
 
-    const response = await chat.sendMessage(prompt);
-
-    const responseText = response.content.trim();
-
-    const finishReason = response.finishReason;
+    const finishReason = response.choices[0].finish_reason;
 
     if (finishReason !== "stop") {
       console.warn("WARNING: response did not finish - ", finishReason);
@@ -425,23 +406,24 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const chat = createChat({
+    const response = await openai.chat.completions.create({
       model: this.options.model,
-      apiKey,
-      maxTokens: this.options.maxTokens,
-      unresponsiveApiTimeout: 5000,
+      max_tokens: this.options.maxTokens,
+      messages: [
+        {
+          role: "system",
+          content: emptySystem,
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
     });
 
-    chat.addMessage({
-      role: "system",
-      content: emptySystem,
-    });
+    const responseText = response.choices[0].message.content.trim();
 
-    const response = await chat.sendMessage(prompt);
-
-    const responseText = response.content.trim();
-
-    const finishReason = response.finishReason;
+    const finishReason = response.choices[0].finish_reason;
 
     if (finishReason !== "stop") {
       console.warn("WARNING: response did not finish - ", finishReason);
@@ -468,23 +450,24 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const chat = createChat({
+    const response = await openai.chat.completions.create({
       model: this.options.model,
-      apiKey,
-      maxTokens: this.options.maxTokens,
-      unresponsiveApiTimeout: 5000,
+      max_tokens: this.options.maxTokens,
+      messages: [
+        {
+          role: "system",
+          content: errorSystem,
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
     });
 
-    chat.addMessage({
-      role: "system",
-      content: errorSystem,
-    });
+    const responseText = response.choices[0].message.content.trim();
 
-    const response = await chat.sendMessage(prompt);
-
-    const responseText = response.content.trim();
-
-    const finishReason = response.finishReason;
+    const finishReason = response.choices[0].finish_reason;
 
     if (finishReason !== "stop") {
       console.warn("WARNING: response did not finish - ", finishReason);
@@ -512,64 +495,109 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const chat = createChat({
-      model: this.options.model,
-      apiKey,
-      temperature: 0.2,
-      maxTokens: this.options.maxTokens,
-      unresponsiveApiTimeout: 5000,
-      functions: [
+    const messages: CompletionCreateParams.CreateChatCompletionRequestNonStreaming.Message[] =
+      [
         {
-          name: "get_all_properties",
-          description:
-            "Returns all possible properties for a node with a given label",
-          parameters: {
-            type: "object",
-            properties: {
-              label: {
-                type: "string",
-                description:
-                  "The label (kind) of node to get possible properties for",
-              },
-            },
-            required: ["label"],
-          },
-          function: this.getAllProperties,
+          role: "system",
+          content: exploreSystem,
         },
         {
-          name: "does_relationship_exist",
-          description:
-            "Returns true if a relationship type exists anywhere in the graph",
-          parameters: {
-            type: "object",
-            properties: {
-              relationship: {
-                type: "string",
-                description: "The relationship label to check for",
-              },
-            },
-            required: ["relationship"],
-          },
-          function: this.doesRelationshipExist,
+          role: "user",
+          content: prompt,
         },
-      ],
-      functionCall: "auto",
-    });
+      ];
 
-    chat.addMessage({
-      role: "system",
-      content: exploreSystem,
-    });
+    let responseText = "";
+    let done = false;
 
-    const response = await chat.sendMessage(prompt);
+    while (!done) {
+      const response = await openai.chat.completions.create({
+        model: this.options.model,
+        temperature: 0.2,
+        max_tokens: this.options.maxTokens,
+        functions: [
+          {
+            name: "get_all_properties",
+            description:
+              "Returns all possible properties for a node with a given label",
+            parameters: {
+              type: "object",
+              properties: {
+                label: {
+                  type: "string",
+                  description:
+                    "The label (kind) of node to get possible properties for",
+                },
+              },
+              required: ["label"],
+            },
+          },
+          {
+            name: "does_relationship_exist",
+            description:
+              "Returns true if a relationship type exists anywhere in the graph",
+            parameters: {
+              type: "object",
+              properties: {
+                relationship: {
+                  type: "string",
+                  description: "The relationship label to check for",
+                },
+              },
+              required: ["relationship"],
+            },
+          },
+        ],
+        function_call: "auto",
+        messages,
+      });
 
-    const responseText = response.content;
+      if (response.choices[0].finish_reason === "function_call") {
+        messages.push(
+          response.choices[0]
+            .message as CompletionCreateParams.CreateChatCompletionRequestNonStreaming.Message
+        );
+        switch (response.choices[0].message.function_call.name) {
+          case "get_all_properties": {
+            const args = JSON.parse(
+              response.choices[0].message.function_call.arguments
+            );
+            const { value } = await this.getAllProperties(args);
+            messages.push({
+              role: "function",
+              name: "get_all_properties",
+              content: JSON.stringify(value),
+            });
+            break;
+          }
+          case "does_relationship_exist": {
+            const args = JSON.parse(
+              response.choices[0].message.function_call.arguments
+            );
+            const { value } = await this.doesRelationshipExist(args);
+            messages.push({
+              role: "function",
+              name: "does_relationship_exist",
+              content: JSON.stringify(value),
+            });
+            break;
+          }
+          default:
+            throw new Error(
+              `Invalid function name ${response.choices[0].message.function_call.name}`
+            );
+        }
+      } else {
+        responseText = response.choices[0].message.content.trim();
+        done = true;
 
-    if (response.finishReason !== "stop") {
-      console.warn(
-        "WARNING: response did not finish - ",
-        response.finishReason
-      );
+        if (response.choices[0].finish_reason !== "stop") {
+          console.warn(
+            "WARNING: response did not finish - ",
+            response.choices[0].finish_reason
+          );
+        }
+      }
     }
 
     if (this.options.verboseResponses) {
@@ -597,23 +625,24 @@ What is the answer to this question: ${objective}`;
       console.log("prompt:", prompt);
     }
 
-    const chat = createChat({
+    const response = await openai.chat.completions.create({
       model: this.options.model,
-      apiKey,
-      maxTokens: this.options.maxTokens,
-      unresponsiveApiTimeout: 5000,
+      max_tokens: this.options.maxTokens,
+      messages: [
+        {
+          role: "system",
+          content: evaluateSystem,
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
     });
 
-    chat.addMessage({
-      role: "system",
-      content: evaluateSystem,
-    });
+    const responseText = response.choices[0].message.content.trim();
 
-    const response = await chat.sendMessage(prompt);
-
-    const responseText = response.content.trim();
-
-    const finishReason = response.finishReason;
+    const finishReason = response.choices[0].finish_reason;
 
     if (finishReason !== "stop") {
       console.warn("WARNING: response did not finish - ", finishReason);

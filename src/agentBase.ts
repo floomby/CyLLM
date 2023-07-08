@@ -5,7 +5,7 @@ import {
   mkdirSync,
   writeFileSync,
 } from "fs";
-import { driver, apiKey } from "./globals";
+import { driver } from "./globals";
 import neo4j from "neo4j-driver";
 import { AttemptSearchTree } from "./searchTree";
 import { dirname } from "path";
@@ -195,13 +195,15 @@ export abstract class AgentBase {
         return undefined;
       }
       return value;
-    }
-    // replace all identity with the actual node id
-    if (key === "identity") {
+    } else if (key === "identity") {
+      // replace all identity with the actual node id
       if ("low" in value && "high" in value) {
         // convert to a string (neo4j has overridden this)
         return value.toString();
       }
+    } else if (key === "embedding") {
+      // we never want to give the llm a raw embedding (obviously)
+      return undefined;
     }
     return value;
   }
