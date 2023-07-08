@@ -1,10 +1,9 @@
 // Generic agent for querying a neo4j database
 
-// IN PROGRESS switch over to the original sdk
-// TODO getting stuck in backtracking loop sometimes
+// PRIORITY getting stuck in backtracking loop sometimes
 // TODO knowledge distillation and pruning
 // TODO smarter result evaluation
-// TODO setup test suite
+// TODO make some tests
 // MINOR figure out how to handle data compartmentalization in the database (neo4j might have something for this)
 // MINOR gracefully handle neo4j db errors (not query errors, we got these covered)
 
