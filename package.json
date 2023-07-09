@@ -8,5 +8,11 @@
     "neo4j-driver": "^5.9.2",
     "openai": "^4.0.0-beta.2",
     "zod": "^3.21.4"
+  },
+  "scripts": {
+    "query": "tsx src/run.ts -- "
+  },
+  "devDependencies": {
+    "tsx": "^3.12.7"
   }
 }
