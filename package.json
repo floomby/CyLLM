@@ -10,9 +10,14 @@
     "zod": "^3.21.4"
   },
   "scripts": {
-    "query": "tsx src/run.ts -- "
+    "query": "tsx src/run.ts -- ",
+    "test": "mocha --timeout 300000"
   },
   "devDependencies": {
+    "@types/chai": "^4.3.5",
+    "@types/mocha": "^10.0.1",
+    "chai": "^4.3.7",
+    "mocha": "^10.2.0",
     "tsx": "^3.12.7"
   }
 }

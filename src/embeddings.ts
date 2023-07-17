@@ -11,7 +11,7 @@ const computeEmbedding = async (input: string) => {
 
 // TODO convert all these to loops for performance
 
-// While ada-002 returns unit vectors our centroids are not necessarily a unit vector
+// While ada-002 returns unit vectors centroids are not necessarily a unit vector
 const computeSimilarity = (embedding1: number[], embedding2: number[]) => {
   // cosine similarity
   const dotProduct = embedding1.reduce(
